@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <meta charset="utf-8">
+    <meta http-equiv="x-ua-compatible" content="ie=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Upgrading/restoring a large PostgreSQL database - Helge Rausch</title>
+    <link rel="stylesheet" href="../css/default.css" />
+    <link href="../atom.xml" type="application/atom+xml" rel="alternate" title="Helge Rausch's Blog" />
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <div class="logo">
+          <a href="../">Helge Rausch</a>
+        </div>
+        <nav>
+          <a href="../blog.html">blog</a>
+          <a href="../about.html">about</a>
+          <a href="../contact.html">contact</a>
+        </nav>
+      </header>
+
+      <main role="main">
+        <article>
+  <section class="header">
+    Posted on February 27, 2018
+    
+  </section>
+  <section>
+    <h1 id="upgradingrestoring-a-large-postgresql-database">Upgrading/restoring a large PostgreSQL database</h1>
+<p><strong>TL;DR: Restoring large tables in Postgres is much faster, if you add the indexes and constraints after the data.</strong></p>
+<p>In my spare time I’m trying to help out at a project called <a href="https://opensnp.org/">OpenSNP</a>, which is an <a href="http://github.com/OpenSNP/snpr">open-source platform</a> that lets you upload your genetic data, downloaded from certain proprietary platforms, connects it to the relevant research and provides it to other researchers, not connected to said platforms. Each of those uploaded files, called a <em>genotype</em>, contains between 0.5M and 1M rows, each of which we parse and store in Postgres. Each of the rows contains a so called <em>SNP</em> (“snip”), or <a href="https://en.wikipedia.org/wiki/Single-nucleotide_polymorphism"><em>single-nucleotide polymorphism</em></a>, which you can imagine as your genetic configuration parameters, the values of which, if you like me are not a biologist, may recognize from biology class: the <a href="https://en.wikipedia.org/wiki/Base_pair">base pairs</a> made up of adenine, cytosine, guanine and thymine. Also, the documentation for that configuration was never written and researchers are only slowly trying to reverse-engineer it with the help of <a href="https://en.wikipedia.org/wiki/Genome-wide_association_study">genome-wide association studies</a>.</p>
+<h2 id="the-data">The Data</h2>
+<p>In Postgres this data is kept in three tables: <code>genotypes</code>, which contain the references to the files and to the users, <code>snps</code>, which contains information related to each of the SNPs, and <code>user_snps</code>, which contains references to the <code>genotypes</code>, the <code>snps</code> and a two-letter string for the base-pairs, one row for each of the rows in each of the genotype files.</p>
+<pre><code>+-----------+   +-----------------+   +------+
+| genotypes |--&lt;| user_snps       |&gt;--| snps |
++-----------+   +-----------------+   +------+
+| user_id   |   | snp_name        |   | name |
+| file      |   | genotype_id     |   | ...  |
+| ...       |   | local_genotype* |   +------+
++-----------+   +-----------------+
+
+* a.k.a. the base pair</code></pre>
+<p>As of this writing, the database contains 4118 genotypes and 1.3B user-SNPs, which is by far the largest table and the only one that ever creates problems in terms of time it takes to insert data into it. Importing a new data set (the 0.5M to 1M rows mentioned earlier), currently takes about 2 hours on average. Most of that time is spent updating the indexes, without indexes inserts are near-instantanious. The whole database amounts to about 210 GB, including indexes. There is a primary key on the <code>user_snps</code> on <code>genotype_id</code> and <code>snp_name</code> and an additional index on <code>snp_name</code> as well as a primary key constraint on the <code>genotype_id</code>.</p>
+<pre><code>snpr=# \d user_snps
+              Table &quot;public.user_snps&quot;
+     Column     |         Type          | Modifiers
+----------------+-----------------------+-----------
+ snp_name       | character varying(32) | not null
+ genotype_id    | integer               | not null
+ local_genotype | bpchar                |
+Indexes:
+    &quot;user_snps_new_pkey&quot; PRIMARY KEY, btree (genotype_id, snp_name)
+    &quot;idx_user_snps_snp_name&quot; btree (snp_name)
+Foreign-key constraints:
+    &quot;user_snps_genotype_id_fk&quot; FOREIGN KEY (genotype_id) REFERENCES genotypes(id)</code></pre>
+<h2 id="migrating-the-data">Migrating the data</h2>
+<p>When migrating the database to a new machine, we decided to migrate from Postgres 9.3 to 9.5, as this is the version that ships with the latest LTS release of Ubuntu. I tried migrating the data using <code>pg_upgrade</code> at first, but after a few days it became clear, that this would take longer than expected. It slowed down quite a bit over time. I manually kept track of the size of Postgres’ data directory now and then, using a Google Sheet.</p>
+<figure>
+<img src="../images/opensnp-db-migration-chart.png" alt="chart: size of PostgreSQL data directory over time" /><figcaption>chart: size of PostgreSQL data directory over time</figcaption>
+</figure>
+<p>For what it’s worth, Google Sheet’s <code>FORECAST</code> function estimated it to finish in just under a year. 😬</p>
+<p>The only reason I could come up with, for it to get slower over time, was that it must be updating the indexes as it inserts into the <code>user_snps</code> table. I vaguely hoped Postgres’ COPY function would copy the data first and re-index afterwards instead, but evidently it doesn’t. Since we didn’t want to wait a whole year, I aborted the mission and started over. This time, in order to avoid this problem, I took separate dumps of the original database, one in text-format for the schema, one in <em>custom</em> format for the data:</p>
+<pre><code>pg_dump --schema-only -Fp snpr &gt; snpr-schema.psql
+pg_dump --data-only -Fc snpr &gt; snpr-data.psql</code></pre>
+<p>I opened the <code>snpr-schema.psql</code> and commented out the indexes, and while I was at it, the foreign key constraints, of the <code>user_snps</code> table. I restored the schema and the data on the new machine and ran the commented out bits after the data was imported. The whole process only took a few hours. Unfortunately, I don’t have a graph or an exact time for that. I ran it overnight and it was done the next morning.</p>
+<h2 id="conclusion">Conclusion</h2>
+<p>When restoring a large Postgres database, import the data before the indexes. The next time I’ll try writing a script for that, unless someone else does it first (*hint*) or it already exists. Additionally, always keeping track of long running processes is a very good idea. Without keeping track of the progress of the import, we wouldn’t have been able to make an informed decision on whether to abort or not. Even better is having a script in place doing that for you, e.g. logging the size of Postgres’ data directory to a file every minute, or have monitoring in place on the machine, keeping track of the disk usage.</p>
+  </section>
+</article>
+
+      </main>
+
+      <footer>
+        <a href="../impressum.html">impressum</a>
+      </footer>
+    </div>
+  </body>
+</html>
